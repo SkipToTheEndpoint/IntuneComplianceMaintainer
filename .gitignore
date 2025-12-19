@@ -1,0 +1,45 @@
+# OS-generated files
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+.DS_Store
+
+# IDE/editor
+.vscode/
+.idea/
+*.code-workspace
+.history/
+
+# Build/output
+bin/
+obj/
+dist/
+out/
+*.tmp
+*.log
+*.cache
+
+# Credentials/configuration
+*.pfx
+*.p12
+*.cer
+*.key
+*.pem
+*.der
+*.jks
+*.keystore
+*.env
+*.env.*
+
+# PowerShell tooling
+*.ps1xml
+*.pssc
+*.psd1
+
+# Archives
+*.zip
+*.tar
+*.gz
+*.7z
+*.rar
