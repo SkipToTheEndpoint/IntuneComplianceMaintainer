@@ -12,8 +12,9 @@ IntuneComplianceMaintainer is a PowerShell automation script that keeps your Int
 - **Dual Policy Types**: Updates both compliance and app-protection policies
 - **Flexible Authentication**: Supports Managed Identity (Azure Automation), App Registration with Certificate, or App Registration with Secret (including Azure Key Vault integration)
 - **Cadence Control**: Configurable delay between update release and policy enforcement to account for update rollout schedule, with optional force-apply override
+- **Android Patch Level**: Enforces minimum Android security patch level alongside OS version; targets the oldest maintained Android version for `osMinimumVersion` (so any supported release passes) and derives the monthly patch date from Android's patch schedule (1st of each month)
 - **Windows Advanced Options**: Support for specific build numbers, update classifications, version ranges, and selectable app-protection target build (lowest by default)
-- **Safety Features**: Optional downgrade protection and dry-run mode
+- **Safety Features**: Optional downgrade protection and dry-run mode (downgrade check covers both OS version and patch level independently)
 - **Retry Logic**: Built-in retry mechanism for API resilience
 - **Comprehensive Logging**: Verbose logging with detailed result output
 
@@ -164,13 +165,24 @@ Deploy to Azure Automation for scheduled runs:
 
 ## How It Works
 
-### For iOS, iPadOS, macOS, and Android
+### For iOS, iPadOS, and macOS
 
 1. Queries endoflife.date API for the latest OS version
 2. Calculates effective date based on release date + cadence days
 3. If effective date has passed:
    - Updates compliance policies with `osMinimumVersion`
-   - Updates app-protection policies with `minimumRequiredOsVersion`
+   - Updates app-protection policies with `minimumRequiredOsVersion` (iOS/iPadOS only; macOS has no app-protection support)
+
+### For Android
+
+1. Queries endoflife.date API to determine all currently maintained Android versions (e.g. 14, 15, 16, 17)
+2. Sets `osMinimumVersion` / `minimumRequiredOsVersion` to the **oldest** maintained version — devices running any supported Android release satisfy the version check
+3. Derives the monthly security patch date from Android's fixed release schedule (1st of each month) and applies cadence from that date
+4. If effective date has passed:
+   - Updates compliance policies with `osMinimumVersion` and `minAndroidSecurityPatchLevel`
+   - Updates app-protection policies with `minimumRequiredOsVersion` and `minimumRequiredPatchVersion`
+   - Both patch level fields use `YYYY-MM-DD` format
+5. Downgrade protection evaluates OS version and patch level independently — a policy with a current OS version but stale patch level will still be updated
 
 ### For Windows
 
@@ -188,13 +200,19 @@ The script provides detailed logging and a summary table:
 ```
 [2025-12-16 10:30:15][INFO] Starting run: DryRun=True; AllowDowngrade=False
 [RESULT][iOS/Compliance] Compliance-iOS-Production: action=WouldUpdate; current=17.6.1; target=18.2.1; effective=2025-12-18
+[RESULT][Android/Compliance] Compliance-Android-Corp: action=WouldUpdate; current=14; target=14; patch=2026-07-01; release=7/1/2026; effective=7/15/2026
+[RESULT][Android/AppProtection] MAM-Android-Corp: action=WouldUpdate; current=14; target=14; patch=2026-07-01; release=7/1/2026; effective=7/15/2026
 [RESULT][Windows/Compliance] Compliance-Windows-Corp: action=WouldUpdate; current=10.0.26100.2314-10.0.26100.2454; target=10.0.26100.2605-10.0.26100.9999; setting=Range
 
-Platform  Type          Setting        Name                      Current        Target         Action        EffectiveDate
---------  ----          -------        ----                      -------        ------         ------        -------------
-iOS       Compliance    MinimumVersion Compliance-iOS-Production 17.6.1         18.2.1         WouldUpdate   12/18/2025
-Windows   Compliance    Range          Compliance-Windows-Corp   10.0.26100...  10.0.26100...  WouldUpdate   12/17/2025
+Platform  Type          Setting        Name                        Current        Target         Action        EffectiveDate
+--------  ----          -------        ----                        -------        ------         ------        -------------
+iOS       Compliance    MinimumVersion Compliance-iOS-Production   17.6.1         18.2.1         WouldUpdate   12/18/2025
+Android   Compliance    MinimumVersion Compliance-Android-Corp     14             14             WouldUpdate   7/15/2026
+Android   AppProtection MinimumVersion MAM-Android-Corp            14             14             WouldUpdate   7/15/2026
+Windows   Compliance    Range          Compliance-Windows-Corp     10.0.26100...  10.0.26100...  WouldUpdate   12/17/2025
 ```
+
+> **Note**: For Android, the `Current` and `Target` columns reflect `osMinimumVersion`. The `patch=` field in the verbose log shows the `minAndroidSecurityPatchLevel` / `minimumRequiredPatchVersion` value being enforced. Where the OS version is already at the target, the update still proceeds if the patch level is stale.
 
 ## Action Types
 
@@ -231,7 +249,11 @@ Windows   Compliance    Range          Compliance-Windows-Corp   10.0.26100...  
 
 ### Android
 - Supports both compliance and app-protection policies
-- Version format: major.minor.patch (e.g., 14.0.0)
+- `osMinimumVersion` is set to the oldest currently maintained Android version (e.g. 14), so devices on any supported release (14, 15, 16, 17, etc.) satisfy the compliance check; the maintained set is determined dynamically from the endoflife.date API
+- Security patch level is updated monthly, aligned with Android's fixed patch release schedule (1st of each month); cadence is applied from that date
+- Compliance policies: patch level written to `minAndroidSecurityPatchLevel`
+- App Protection policies: patch level written to `minimumRequiredPatchVersion`
+- Both patch level fields use `YYYY-MM-DD` format (e.g. `2026-07-01`)
 
 ## Troubleshooting
 ### Authentication Errors
@@ -260,6 +282,7 @@ Windows   Compliance    Range          Compliance-Windows-Corp   10.0.26100...  
 
 ## Version History
 
+- **v1.2** (2026-07-01): Android multi-version support (targets oldest maintained release for `osMinimumVersion`); monthly Android security patch level enforcement (`minAndroidSecurityPatchLevel` / `minimumRequiredPatchVersion`); downgrade protection now evaluates OS version and patch level independently; `Get-AzAccessToken` SecureString compatibility for Az module 12.0+
 - **v1.1** (2025-12-19): Added Azure Automation managed identity support, force-apply option, Windows app protection target selection, release date tracking
 - **v1.0** (2025-12-15): Initial release
 

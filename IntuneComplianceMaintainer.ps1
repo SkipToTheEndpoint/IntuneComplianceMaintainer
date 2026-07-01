@@ -17,8 +17,8 @@
 .NOTES
     Author: James Robinson | SkipToTheEndpoint | https://skiptotheendpoint.co.uk
     Link: https://stte.me/automatecompliance
-    Version: v1.0
-    Release Date: 2025-12-15
+    Version: v2.0
+    Release Date: 2026-07-01
 #>
 
 # --------------------------- Authentication ---------------------------
@@ -113,7 +113,7 @@ function Get-GraphToken {
           throw "Get-AzAccessToken returned no token"
         }
         
-        $token = $tokenObj.Token
+        $token = [System.Net.NetworkCredential]::new('', $tokenObj.Token).Password
       } catch {
         $errMsg = $_.Exception.Message
         throw "Managed Identity authentication failed: $errMsg. Ensure managed identity is enabled on the Automation Account and has Graph API permissions (DeviceManagementConfiguration.ReadWrite.All, DeviceManagementApps.ReadWrite.All, WindowsUpdates.ReadWrite.All)."
@@ -186,7 +186,10 @@ function Write-ResultLog {
   $relText = if ($release) { "; release=$release" } else { "" }
   $settingText = if ($setting) { "; setting=$setting" } else { "" }
   $errorText = if ($errorMsg) { "; error=$errorMsg" } else { "" }
-  Write-Host "[RESULT][$($Row.Platform)/$($Row.Type)] $($Row.Name): action=$($Row.Action); current=$($Row.Current); target=$($Row.Target)$settingText$relText$effText$errorText"
+  $targetPatch = $null
+  if ($Row.PSObject.Properties.Name -contains "TargetPatch") { $targetPatch = $Row.TargetPatch }
+  $patchText = if ($targetPatch) { "; patch=$targetPatch" } else { "" }
+  Write-Host "[RESULT][$($Row.Platform)/$($Row.Type)] $($Row.Name): action=$($Row.Action); current=$($Row.Current); target=$($Row.Target)$patchText$settingText$relText$effText$errorText"
 }
 
 function Get-CompliancePolicyInfo {
@@ -202,7 +205,11 @@ function Get-CompliancePolicyInfo {
   if ($policy.PSObject.Properties.Name -contains "osMinimumVersion") {
     $currentOs = $policy.osMinimumVersion
   }
-  return [pscustomobject]@{Name=$policy.displayName;Current=$currentOs;Ranges=$ranges}
+  $currentPatch = $null
+  if ($policy.PSObject.Properties.Name -contains "minAndroidSecurityPatchLevel") {
+    $currentPatch = $policy.minAndroidSecurityPatchLevel
+  }
+  return [pscustomobject]@{Name=$policy.displayName;Current=$currentOs;Ranges=$ranges;CurrentPatch=$currentPatch}
 }
 
 function Get-RangeText {
@@ -241,7 +248,11 @@ function Get-AppProtectionPolicyInfo {
   if (-not $current -and ($policy.PSObject.Properties.Name -contains "minimumRequiredOperatingSystem")) {
     $current = $policy.minimumRequiredOperatingSystem
   }
-  return [pscustomobject]@{Name=$policy.displayName;Current=$current}
+  $currentPatch = $null
+  if ($policy.PSObject.Properties.Name -contains "minimumRequiredPatchVersion") {
+    $currentPatch = $policy.minimumRequiredPatchVersion
+  }
+  return [pscustomobject]@{Name=$policy.displayName;Current=$current;CurrentPatch=$currentPatch}
 }
 
 function Get-LatestOsVersion {
@@ -249,7 +260,7 @@ function Get-LatestOsVersion {
   $url = "https://endoflife.date/api/v1/products/$ProductSlug/releases/latest"
   $res = Invoke-RestMethod -Uri $url -Method Get
   $release = $res.result
-  $targetVersion = $release.latest.name
+  $targetVersion = if ($release.latest.name) { $release.latest.name } else { $release.name }
   # Use the date of the latest patch/hotfix release to drive cadence; fall back to major release date if missing.
   $dateSource = $release.latest.date
   if (-not $dateSource) { $dateSource = $release.releaseDate }
@@ -258,6 +269,32 @@ function Get-LatestOsVersion {
   return [pscustomobject]@{
     Version       = $targetVersion
     ReleaseDate   = $releaseDate
+    EffectiveDate = $effectiveDate
+  }
+}
+
+function Get-AndroidVersionData {
+  param([int]$CadenceDays)
+  # Fetch all Android releases and filter to maintained (non-EOL) ones only.
+  $url = "https://endoflife.date/api/v1/products/android/"
+  $res = Invoke-RestMethod -Uri $url -Method Get
+  $maintained = @($res.result.releases | Where-Object { $_.isMaintained -eq $true })
+  if (-not $maintained -or $maintained.Count -eq 0) {
+    throw "No maintained Android releases found from endoflife.date"
+  }
+  # Sort numerically so the oldest maintained version can be selected reliably.
+  $sorted = $maintained | Sort-Object { [System.Version]"$($_.name).0" }
+  $oldest = $sorted | Select-Object -First 1
+  # Android releases a security patch on the 1st of every month. Use the 1st of
+  # the current month as the patch release date and apply cadence from there,
+  # consistent with how all other platform releases are treated.
+  $today = Get-Date
+  $patchReleaseDate = (Get-Date -Year $today.Year -Month $today.Month -Day 1).Date
+  $effectiveDate = $patchReleaseDate.AddDays($CadenceDays)
+  return [pscustomobject]@{
+    Version       = $oldest.name                                    # oldest maintained → osMinimumVersion
+    PatchDate     = $patchReleaseDate.ToString("yyyy-MM-dd")        # 1st of current month → patch level
+    ReleaseDate   = $patchReleaseDate
     EffectiveDate = $effectiveDate
   }
 }
@@ -273,7 +310,9 @@ function Get-WindowsBuildRanges {
   )
 
   $headers = @{Authorization = "Bearer $Token"}
-  $filter = "$`$filter=microsoft.graph.windowsUpdates.qualityUpdateCatalogEntry/qualityUpdateClassification eq '$Classification'&"
+  if (-not $Classification) { $Classification = "nonSecurity" }
+  if ($NumberOfUpdates -le 0) { $NumberOfUpdates = 1 }
+  $filter = "`$filter=microsoft.graph.windowsUpdates.qualityUpdateCatalogEntry/qualityUpdateClassification eq '$Classification'&"
   $uri = "https://graph.microsoft.com/beta/admin/windows/updates/catalog/entries?`$select=microsoft.graph.windowsUpdates.qualityUpdateCatalogEntry/productRevisions&`$expand=microsoft.graph.windowsUpdates.qualityUpdateCatalogEntry/productRevisions&${filter}`$orderby=releaseDateTime%20desc&`$top=$NumberOfUpdates"
   $response = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
     Invoke-RestMethod -Method Get -Uri $uri -Headers $headers
@@ -352,39 +391,46 @@ function Get-WindowsTargetVersionFromRanges {
 }
 
 function Update-CompliancePolicy {
-  param([string]$Token,[string]$PolicyId,[string]$TargetVersion,[bool]$DryRun,[bool]$AllowDowngrade,[string]$Platform,[datetime]$ReleaseDate)
+  param([string]$Token,[string]$PolicyId,[string]$TargetVersion,[bool]$DryRun,[bool]$AllowDowngrade,[string]$Platform,[datetime]$ReleaseDate,[string]$PatchLevel)
   $headers = @{Authorization = "Bearer $Token"}
   $uri = "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies/$PolicyId"
   $policy = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-RestMethod -Method Get -Uri $uri -Headers $headers }
   $name = $policy.displayName
   $current = $policy.osMinimumVersion
+  $currentPatch = $policy.minAndroidSecurityPatchLevel
   $detectedPlatform = $Platform
   if (-not $detectedPlatform) {
     $rawType = $policy.'@odata.type'
     if ($rawType -match "\.([A-Za-z]+)CompliancePolicy$") { $detectedPlatform = $matches[1] }
   }
   if ($detectedPlatform -eq "macOS") { $detectedPlatform = "macOS" }
-  if (-not $AllowDowngrade -and $current -and ([version]$current -ge [version]$TargetVersion)) {
-    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Skipped"}
+  # Skip only when both OS version and patch level (if applicable) are already current.
+  $osUpToDate = $current -and ([version]$current -ge [version]$TargetVersion)
+  $patchUpToDate = -not $PatchLevel -or ($currentPatch -and ($currentPatch -ge $PatchLevel))
+  if (-not $AllowDowngrade -and $osUpToDate -and $patchUpToDate) {
+    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Skipped";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   if ($DryRun) {
-    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="WouldUpdate"}
+    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="WouldUpdate";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   try {
     $body = @{
       "@odata.type" = $policy.'@odata.type'
       "osMinimumVersion" = "$TargetVersion"
     }
+    if ($detectedPlatform -eq "Android" -and $PatchLevel) {
+      $body["minAndroidSecurityPatchLevel"] = $PatchLevel
+    }
     Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
       Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body ($body | ConvertTo-Json)
     }
-    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Updated"}
+    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Updated";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   catch {
     $errMsg = $_.Exception.Message
     if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = $_.ErrorDetails.Message }
     elseif ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = $_.Exception.Response.Content }
-    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Error";Error=$errMsg}
+    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Error";Error=$errMsg;TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
 }
 
@@ -428,7 +474,7 @@ function Update-WindowsCompliancePolicy {
 }
 
 function Update-AppProtectionPolicy {
-  param([string]$Token,[string]$PolicyId,[string]$TargetVersion,[bool]$DryRun,[bool]$AllowDowngrade,[string]$Platform,[datetime]$ReleaseDate,[datetime]$EffectiveDate)
+  param([string]$Token,[string]$PolicyId,[string]$TargetVersion,[bool]$DryRun,[bool]$AllowDowngrade,[string]$Platform,[datetime]$ReleaseDate,[datetime]$EffectiveDate,[string]$PatchLevel)
   $headers = @{Authorization = "Bearer $Token"}
   switch ($Platform) {
     "Android" { $uri = "https://graph.microsoft.com/beta/deviceAppManagement/androidManagedAppProtections/$PolicyId" }
@@ -438,23 +484,31 @@ function Update-AppProtectionPolicy {
   $policy = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-RestMethod -Method Get -Uri $uri -Headers $headers }
   $name = $policy.displayName
   $current = $policy.minimumRequiredOsVersion
-  if (-not $AllowDowngrade -and $current -and ([version]$current -ge [version]$TargetVersion)) {
-    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Skipped"}
+  $currentPatch = if ($Platform -eq "Android") { $policy.minimumRequiredPatchVersion } else { $null }
+  # Skip only when both OS version and patch level (if applicable) are already current.
+  $osUpToDate = $current -and ([version]$current -ge [version]$TargetVersion)
+  $patchUpToDate = -not $PatchLevel -or ($currentPatch -and ($currentPatch -ge $PatchLevel))
+  if (-not $AllowDowngrade -and $osUpToDate -and $patchUpToDate) {
+    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Skipped";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   if ($DryRun) {
-    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="WouldUpdate"}
+    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="WouldUpdate";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   try {
-    Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
-      Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body (@{minimumRequiredOsVersion=$TargetVersion} | ConvertTo-Json)
+    $body = @{ minimumRequiredOsVersion = $TargetVersion }
+    if ($Platform -eq "Android" -and $PatchLevel) {
+      $body["minimumRequiredPatchVersion"] = $PatchLevel
     }
-    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Updated"}
+    Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
+      Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body ($body | ConvertTo-Json)
+    }
+    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Updated";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   catch {
     $errMsg = $_.Exception.Message
     if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = $_.ErrorDetails.Message }
     elseif ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = $_.Exception.Response.Content }
-    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Error";Error=$errMsg}
+    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Error";Error=$errMsg;TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
 }
 
@@ -498,11 +552,14 @@ foreach ($platform in $EolProducts.Keys) {
   $winData = $null
 
   if ($platform -eq "Windows" -and ($hasCompliance -or $hasAppProtect)) {
-    $winData = Get-WindowsBuildRanges -Token $token -BuildNumbers $WindowsBuildNumbers -Classification $WindowsUpdateClassification -NumberOfUpdates $WindowsNumberOfUpdates -AllowNewerBuilds $WindowsAllowNewerBuilds -CadenceDays $CadenceDays
+    $winData = Get-WindowsBuildRanges -Token $token -BuildNumbers $WindowsBuildNumbers -Classification $WindowsUpdateClassification -NumberOfUpdates $WindowsNumberOfUpdates -AllowNewerBuilds ([bool]$WindowsAllowNewerBuilds) -CadenceDays $CadenceDays
   }
 
   if ($platform -eq "Windows" -and $hasCompliance) {
     $notEffectiveCompliance = $winData.EffectiveDate -and ($now -lt $winData.EffectiveDate)
+  } elseif ($platform -eq "Android") {
+    $latest = Get-AndroidVersionData -CadenceDays $CadenceDays
+    $notEffectiveCompliance = $now -lt $latest.EffectiveDate
   } else {
     $latest = Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays
     $notEffectiveCompliance = $now -lt $latest.EffectiveDate
@@ -511,6 +568,9 @@ foreach ($platform in $EolProducts.Keys) {
   if ($hasAppProtect) {
     if ($platform -eq "Windows") {
       $notEffectiveApp = $winData.EffectiveDate -and ($now -lt $winData.EffectiveDate)
+    } elseif ($platform -eq "Android") {
+      $appLatest = if ($latest) { $latest } else { Get-AndroidVersionData -CadenceDays $CadenceDays }
+      $notEffectiveApp = $now -lt $appLatest.EffectiveDate
     } else {
       $appLatest = Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays
       $notEffectiveApp = $now -lt $appLatest.EffectiveDate
@@ -521,7 +581,6 @@ foreach ($platform in $EolProducts.Keys) {
     if ($platform -eq "Windows") {
       $info = Get-CompliancePolicyInfo -Token $token -PolicyId $policyId
       if ($WindowsComplianceMode -eq "MinimumVersion") {
-        # Use highest build as an osMinimumVersion-like value
         $winMinVersion = Get-WindowsTargetVersionFromRanges -Ranges $winData.Ranges -Mode "HighestLowest"
         $targetText = $winMinVersion
         $currentText = if ($info.Current) { $info.Current } else { Get-RangeText -Ranges $info.Ranges }
@@ -556,29 +615,31 @@ foreach ($platform in $EolProducts.Keys) {
     if ($notEffectiveCompliance) {
       $info = Get-CompliancePolicyInfo -Token $token -PolicyId $policyId
       if (-not $ForceApply) {
-        $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting="MinimumVersion";Name=$info.Name;Current=$info.Current;Target=$latest.Version;ReleaseDate=$latest.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$latest.EffectiveDate}
+        $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting="MinimumVersion";Name=$info.Name;Current=$info.Current;Target=$latest.Version;ReleaseDate=$latest.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$latest.EffectiveDate;TargetPatch=$latest.PatchDate;CurrentPatch=$info.CurrentPatch}
         continue
       }
     }
-    $results += Update-CompliancePolicy -Token $token -PolicyId $policyId -TargetVersion $latest.Version -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $latest.ReleaseDate
+    $results += Update-CompliancePolicy -Token $token -PolicyId $policyId -TargetVersion $latest.Version -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $latest.ReleaseDate -PatchLevel $latest.PatchDate
   }
   foreach ($policyId in $AppProtectionPolicies[$platform]) {
-    # Endpoint differs per platform; adjust base if needed. For brevity, using iOS path; change to androidManagedAppProtections/windowsManagedAppProtections/macOSManagedAppProtections as appropriate.
     if ($platform -eq "Windows") {
-      $info = Get-AppProtectionPolicyInfo -Token $token -PolicyId $policyId -Platform $platform
+      $effective = $winData.EffectiveDate
+      $releaseDate = $winData.ReleaseDate
       $targetVersion = $null
       if ($winData -and $winData.Ranges -and $winData.Ranges.Count -gt 0) {
         $appTargetMode = if ($WindowsAppProtectionTarget -eq "Highest") { "HighestHighest" } else { "LowestLowest" }
         $targetVersion = Get-WindowsTargetVersionFromRanges -Ranges $winData.Ranges -Mode $appTargetMode
       }
-      $effective = $winData.EffectiveDate
-      $releaseDate = $winData.ReleaseDate
       if (-not $winData -or -not $winData.Ranges -or $winData.Ranges.Count -eq 0 -or -not $targetVersion) {
-        $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$info.Name;Current=$info.Current;Target="(none)";ReleaseDate=$releaseDate;Action="NoData";EffectiveDate=$effective}
+        $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$policyId;Current="(unknown)";Target="(none)";ReleaseDate=$releaseDate;Action="NoData";EffectiveDate=$effective}
         continue
       }
+      # Check cadence before making any API calls; fetch info only when needed for the
+      # NotEffectiveYet display name, with a graceful fallback to the policy ID.
       if ($notEffectiveApp -and -not $ForceApply) {
-        $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$info.Name;Current=$info.Current;Target=$targetVersion;ReleaseDate=$releaseDate;Action="NotEffectiveYet";EffectiveDate=$effective}
+        $policyName = $policyId
+        try { $policyName = (Get-AppProtectionPolicyInfo -Token $token -PolicyId $policyId -Platform $platform).Name } catch {}
+        $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$policyName;Current="(unknown)";Target=$targetVersion;ReleaseDate=$releaseDate;Action="NotEffectiveYet";EffectiveDate=$effective}
         continue
       }
       $results += Update-AppProtectionPolicy -Token $token -PolicyId $policyId -TargetVersion $targetVersion -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $releaseDate -EffectiveDate $effective
@@ -587,10 +648,10 @@ foreach ($platform in $EolProducts.Keys) {
 
     if ($notEffectiveApp -and -not $ForceApply) {
       $info = Get-AppProtectionPolicyInfo -Token $token -PolicyId $policyId -Platform $platform
-      $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$info.Name;Current=$info.Current;Target=$appLatest.Version;ReleaseDate=$appLatest.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$appLatest.EffectiveDate}
+      $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$info.Name;Current=$info.Current;Target=$appLatest.Version;ReleaseDate=$appLatest.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$appLatest.EffectiveDate;TargetPatch=$appLatest.PatchDate;CurrentPatch=$info.CurrentPatch}
       continue
     }
-    $results += Update-AppProtectionPolicy -Token $token -PolicyId $policyId -TargetVersion $appLatest.Version -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $appLatest.ReleaseDate -EffectiveDate $appLatest.EffectiveDate
+    $results += Update-AppProtectionPolicy -Token $token -PolicyId $policyId -TargetVersion $appLatest.Version -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $appLatest.ReleaseDate -EffectiveDate $appLatest.EffectiveDate -PatchLevel $appLatest.PatchDate
   }
 }
 
